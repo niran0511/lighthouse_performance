@@ -1,4 +1,4 @@
-import chromeLauncher from 'chrome-launcher';
+import { launch as launchChrome } from 'chrome-launcher';
 import lighthouse from 'lighthouse';
 import { config } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
@@ -46,14 +46,34 @@ export function normalizeLighthouseResult(lhr) {
 }
 
 export async function executeLighthouse(url, dependencies = {}) {
-  const launchChrome = dependencies.launchChrome || chromeLauncher.launch;
+  const chromeLauncher = dependencies.launchChrome || launchChrome;
   const runLighthouse = dependencies.runLighthouse || lighthouse;
   let chrome;
+  let result;
+  let timeoutHandle;
+  
   try {
-    chrome = await launchChrome({
+    chrome = await chromeLauncher({
       chromeFlags: ['--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      userDataDir: false,
     });
-    const result = await Promise.race([
+    
+    // Set up timeout that will forcefully kill Chrome
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(async () => {
+        console.warn('[WARN] Lighthouse timeout reached, forcefully killing Chrome...');
+        if (chrome) {
+          try {
+            await chrome.kill();
+          } catch (e) {
+            console.error('[ERROR] Failed to kill Chrome on timeout:', e.message);
+          }
+        }
+        reject(new AppError('Lighthouse scan timed out.', 504, 'LIGHTHOUSE_TIMEOUT'));
+      }, config.lighthouseTimeoutMs);
+    });
+    
+    result = await Promise.race([
       runLighthouse(url, {
         port: chrome.port,
         output: 'json',
@@ -62,15 +82,39 @@ export async function executeLighthouse(url, dependencies = {}) {
         formFactor: 'desktop',
         screenEmulation: { disabled: true },
       }),
-      new Promise((_, reject) => setTimeout(() => reject(new AppError('Lighthouse scan timed out.', 504, 'LIGHTHOUSE_TIMEOUT')), config.lighthouseTimeoutMs)),
+      timeoutPromise,
     ]);
+    
+    // Clear timeout if scan completed successfully
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    
     if (!result?.lhr) throw new AppError('Lighthouse did not return a report.', 502, 'LIGHTHOUSE_SCAN_FAILED');
+    
+    // Clean up Chrome before returning
+    if (chrome) {
+      try {
+        await chrome.kill();
+      } catch (cleanupError) {
+        console.warn('[WARN] Chrome cleanup failed (non-critical):', cleanupError.message);
+      }
+    }
+    
     return normalizeLighthouseResult(result.lhr);
   } catch (error) {
+    // Clear timeout on error
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    
+    // Clean up Chrome on error
+    if (chrome) {
+      try {
+        await chrome.kill();
+      } catch (cleanupError) {
+        console.warn('[WARN] Chrome cleanup failed during error handling:', cleanupError.message);
+      }
+    }
+    
     if (error instanceof AppError) throw error;
     throw new AppError('Unable to analyze the provided URL.', 502, 'LIGHTHOUSE_SCAN_FAILED');
-  } finally {
-    if (chrome) await chrome.kill().catch(() => undefined);
   }
 }
 
